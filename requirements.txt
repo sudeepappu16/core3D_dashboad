@@ -1,0 +1,8 @@
+streamlit
+trimesh
+plotly
+kaleido
+pandas
+weasyprint
+psycopg2-binary
+SQLAlchemy
