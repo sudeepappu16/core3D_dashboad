@@ -6,3 +6,4 @@ pandas
 weasyprint
 psycopg2-binary
 SQLAlchemy
+Werkzeug
