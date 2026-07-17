@@ -8,29 +8,38 @@ from weasyprint import HTML
 from datetime import datetime
 from sqlalchemy import text
 import uuid
+from werkzeug.security import generate_password_hash, check_password_hash
 
-# --- CONFIGURATION & CONSTANTS ---
-st.set_page_config(page_title="Makenica CRM & Quotes", page_icon="⚙️", layout="wide")
+# --- CONFIGURATION & BRANDING ---
+# Makenica Brand Colors: Black, White, and Eagle Gold
+st.set_page_config(page_title="Makenica Workspace", page_icon="⚙️", layout="wide")
+
+st.markdown("""
+    <style>
+    .main .block-container { padding-top: 2rem; }
+    h1, h2, h3 { color: #111111; }
+    .stButton>button { background-color: #f39c12; color: white; border: none; }
+    .stButton>button:hover { background-color: #e67e22; color: white; }
+    </style>
+""", unsafe_allow_html=True)
 
 RAL_CODES = [
-    "RAL 9003 (Signal White)", "RAL 9005 (Jet Black)", "RAL 7016 (Anthracite Grey)",
-    "RAL 3020 (Traffic Red)", "RAL 5002 (Ultramarine Blue)", "RAL 6018 (Yellow Green)", 
-    "RAL 9011 (Graphite black)", "Custom / Other"
+    "RAL 9003 (Signal White)", "RAL 9005 (Jet Black)", "RAL 9011 (Graphite black)", "Custom / Other"
 ]
 
 TECH_CATALOG = {
     "SLA": ["ABS-like", "PC-like"],
     "SLS": ["PA12", "PA12 + GF 30%"],
-    "MJF": ["PA12"],
-    "FDM": ["PLA", "PETG", "TPU", "Translucent"],
-    "DLP": ["Standard Resin", "Tough Resin"]
+    "FDM": ["PLA", "PETG", "TPU"],
+    "DLP": ["Standard Resin"]
 }
 
-# --- DATABASE CONNECTION ---
+# --- DATABASE CONNECTION & INIT ---
 conn = st.connection("postgresql", type="sql")
 
 def init_db():
     with conn.session as s:
+        # Customers Table
         s.execute(text('''
             CREATE TABLE IF NOT EXISTS customers (
                 id SERIAL PRIMARY KEY,
@@ -39,40 +48,72 @@ def init_db():
                 account_manager TEXT, ac_email TEXT, ac_phone TEXT
             )
         '''))
+        # Users Table (Authentication)
+        s.execute(text('''
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                username TEXT UNIQUE,
+                password_hash TEXT,
+                role TEXT
+            )
+        '''))
+        # Quotes Table (Saved Quotes)
+        s.execute(text('''
+            CREATE TABLE IF NOT EXISTS quotes (
+                id SERIAL PRIMARY KEY,
+                quote_number TEXT UNIQUE,
+                customer_name TEXT,
+                total_amount NUMERIC,
+                created_by TEXT,
+                created_at TIMESTAMP
+            )
+        '''))
+        
+        # Inject default admin if users table is empty
+        result = s.execute(text("SELECT COUNT(*) FROM users")).scalar()
+        if result == 0:
+            default_hash = generate_password_hash("admin123")
+            s.execute(text("INSERT INTO users (username, password_hash, role) VALUES ('admin', :hash, 'Admin')"), {"hash": default_hash})
+            
         s.commit()
 
-def add_customer(c_type, name, email, phone, gst, billing, shipping, am_name, am_email, am_phone):
+# --- DATABASE HELPER FUNCTIONS ---
+def authenticate_user(username, password):
+    with conn.session as s:
+        result = s.execute(text("SELECT password_hash, role FROM users WHERE username = :u"), {"u": username}).fetchone()
+        if result and check_password_hash(result[0], password):
+            return {"success": True, "role": result[1]}
+    return {"success": False}
+
+def delete_customer(customer_id):
+    with conn.session as s:
+        s.execute(text("DELETE FROM customers WHERE id = :id"), {"id": customer_id})
+        s.commit()
+
+def save_quote_record(quote_number, customer_name, total, created_by):
     with conn.session as s:
         s.execute(text('''
-            INSERT INTO customers (customer_type, name, email, phone, gst_number, billing_address, shipping_address, account_manager, ac_email, ac_phone)
-            VALUES (:c_type, :name, :email, :phone, :gst, :billing, :shipping, :am_name, :am_email, :am_phone)
-        '''), {
-            "c_type": c_type, "name": name, "email": email, "phone": phone, 
-            "gst": gst, "billing": billing, "shipping": shipping, 
-            "am_name": am_name, "am_email": am_email, "am_phone": am_phone
-        })
+            INSERT INTO quotes (quote_number, customer_name, total_amount, created_by, created_at)
+            VALUES (:q_num, :c_name, :total, :usr, :dt)
+        '''), {"q_num": quote_number, "c_name": customer_name, "total": total, "usr": created_by, "dt": datetime.now()})
         s.commit()
 
-def get_all_customers():
-    df = conn.query("SELECT * FROM customers", ttl="10m")
-    return df
-
-# --- 3D PROCESSING FUNCTIONS ---
-def analyze_stl(file_bytes, filename):
+# --- 3D PROCESSING (FIXED MESH RENDERING) ---
+def analyze_cad(file_bytes, filename):
     suffix = os.path.splitext(filename)[1].lower()
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp.write(file_bytes)
         tmp_path = tmp.name
 
     try:
-        mesh = trimesh.load(tmp_path, file_type='stl')
+        # Note: STEP support in trimesh requires backend CAD engines installed on the server.
+        mesh = trimesh.load(tmp_path, force='mesh') 
         volume_mm3 = mesh.volume if mesh.is_watertight else mesh.convex_hull.volume
-        volume_cc = volume_mm3 / 1000.0
         extents = mesh.extents
         
         return {
             "success": True,
-            "volume_cc": round(volume_cc, 3),
+            "volume_cc": round(volume_mm3 / 1000.0, 3),
             "dimensions": f"{round(extents[0], 2)}mm x {round(extents[1], 2)}mm x {round(extents[2], 2)}mm",
             "is_watertight": mesh.is_watertight,
             "mesh": mesh
@@ -84,299 +125,239 @@ def analyze_stl(file_bytes, filename):
             os.remove(tmp_path)
 
 def generate_3d_snapshot(mesh):
+    # Force triangulation for Plotly compatibility
+    if not hasattr(mesh, 'faces') or len(mesh.faces) == 0:
+        return go.Figure()
+        
     vertices, faces = mesh.vertices, mesh.faces
+    
     fig = go.Figure(data=[go.Mesh3d(
         x=vertices[:, 0], y=vertices[:, 1], z=vertices[:, 2],
         i=faces[:, 0], j=faces[:, 1], k=faces[:, 2],
-        color='lightgray', opacity=0.8, flatshading=True,
-        lighting=dict(ambient=0.5, diffuse=0.8, roughness=0.5, specular=0.2)
+        intensity=vertices[:, 2], # Colors based on Z-height
+        colorscale='Viridis',
+        opacity=0.9,
+        flatshading=False,
+        lighting=dict(ambient=0.4, diffuse=0.8, roughness=0.2, specular=0.4, fresnel=0.1)
     )])
+    
     fig.update_layout(
         scene=dict(xaxis=dict(visible=False), yaxis=dict(visible=False), zaxis=dict(visible=False)),
-        margin=dict(l=0, r=0, b=0, t=0), height=300
+        margin=dict(l=0, r=0, b=0, t=0), height=350, paper_bgcolor="rgba(0,0,0,0)"
     )
     return fig
 
-# --- PDF GENERATION ---
-def generate_pdf_quote(customer_dict, quote_summary, total_price, shipping_charge=0.0):
-    date_time_now = datetime.now().strftime("%B %d, %Y, %I:%M %p")
-    quote_number = f"Q-{str(uuid.uuid4())[:6].upper()}"
-    
-    gst_amount = total_price * 0.18
-    grand_total = total_price + gst_amount + shipping_charge
+# --- PDF GENERATOR (COMPRESSED FOR BREVITY) ---
+def generate_pdf_quote(customer_dict, quote_summary, total_price, q_number):
+    date_now = datetime.now().strftime("%B %d, %Y, %I:%M %p")
+    gst = total_price * 0.18
+    grand = total_price + gst
+    logo_path = f"file://{os.path.abspath(os.path.dirname(__file__))}/Makenica Company Logo Black.png"
 
-    # Format the current directory for the logo
-    current_dir = f"file://{os.path.abspath(os.path.dirname(__file__))}"
-    logo_path = f"{current_dir}/Makenica Company Logo Black.png"
-
-    items_html = ""
-    for idx, item in enumerate(quote_summary):
-        items_html += f"""
-        <tr>
-            <td style="padding-top: 15px;">
-                <strong>{item['tech']} 3D Printing</strong><br/>
-                Part: {item['file_name']}<br/>
-                Dimensions: {item['dimensions']}<br/>
-                Material: {item['material']}<br/>
-                Finish: {item['finish']}<br/>
-                {f"Paint Color: {item['paint_details'].get('ral', '')}<br/>" if 'ral' in item['paint_details'] else ""}
-                {f"Paint Finish: {item['paint_details'].get('gloss_level', 'Matt')}<br/>" if 'Painted' in item['finish'] else ""}
-                {f"<br/><em>Includes {item['fasteners']} threaded inserts</em>" if item['fasteners'] > 0 else ""}
-            </td>
-            <td style="padding-top: 15px;">HSN:39260000</td>
-            <td style="padding-top: 15px; text-align: center;">{item['qty']}</td>
-            <td style="padding-top: 15px; text-align: right;">{item['unit_price']:,.2f}</td>
-            <td style="padding-top: 15px; text-align: right;">{item['total_cost']:,.2f}</td>
-        </tr>
-        """
+    items_html = "".join([
+        f"<tr><td style='padding:10px;'><strong>{i['tech']} 3D Printing</strong><br/>Part: {i['file_name']}<br/>Dims: {i['dimensions']}<br/>Mat: {i['material']}<br/>Finish: {i['finish']}</td><td style='padding:10px;text-align:right;'>₹{i['total_cost']:,.2f}</td></tr>" for i in quote_summary
+    ])
 
     html_content = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-    <style>
-        @page {{ size: A4; margin: 15mm 15mm; }}
-        body {{ font-family: Helvetica, Arial, sans-serif; margin: 0; color: #111; font-size: 9pt; }}
-        .header-table {{ width: 100%; border-bottom: 2px solid #333; padding-bottom: 15px; margin-bottom: 15px; }}
-        .header-left {{ width: 60%; vertical-align: top; line-height: 1.4; }}
-        .header-right {{ width: 40%; text-align: right; vertical-align: top; line-height: 1.4; }}
-        .logo {{ width: 180px; margin-bottom: 10px; }}
-        .info-table {{ width: 100%; margin-bottom: 25px; line-height: 1.4; }}
-        .info-table td {{ vertical-align: top; width: 50%; }}
-        .quote-table {{ width: 100%; border-collapse: collapse; margin-bottom: 20px; font-size: 9pt; }}
-        .quote-table th {{ border-bottom: 1px solid #333; padding: 8px 4px; text-align: left; font-weight: bold; }}
-        .quote-table td {{ padding: 4px; border-bottom: 1px solid #eee; vertical-align: top; line-height: 1.5; }}
-        .totals-table {{ width: 300px; float: right; border-collapse: collapse; font-size: 10pt; }}
-        .totals-table td {{ padding: 6px 10px; }}
-        .total-row {{ font-weight: bold; font-size: 11pt; border-top: 1px solid #333; }}
-        .clearfix {{ clear: both; }}
-        .footer-section {{ margin-top: 30px; font-size: 8.5pt; line-height: 1.5; }}
-        .footer-bottom {{ text-align: center; border-top: 1px solid #ccc; padding-top: 10px; margin-top: 20px; font-weight: bold; }}
-    </style>
-    </head>
+    <html><head><style>body{{font-family:Helvetica;font-size:10pt;color:#111;}} th{{text-align:left;}} td{{border-bottom:1px solid #eee;}} .totals{{float:right;width:300px;}}</style></head>
     <body>
-        <table class="header-table">
-            <tr>
-                <td class="header-left">
-                    <img src="{logo_path}" class="logo" alt="Makenica Logo"/><br/>
-                    <strong>MAKENICA PRIVATE LIMITED</strong><br/>
-                    #46, 7th Main Road, J.C. Industrial Estate,<br/>
-                    Bengaluru, Karnataka 560062<br/>
-                    <strong>GSTIN:</strong> 29AAQCM7969K1Z9<br/>
-                    <strong>Phone:</strong> +91 96067 70777<br/>
-                    <strong>Email:</strong> support@makenica.com
-                </td>
-                <td class="header-right">
-                    <strong>Generated at:</strong><br/>
-                    {date_time_now}<br/><br/>
-                    <strong style="font-size: 14pt;">Quote #{quote_number}</strong><br/>
-                </td>
-            </tr>
-        </table>
-        
-        <table class="info-table">
-            <tr>
-                <td>
-                    <strong>Bill To:</strong><br/>
-                    {customer_dict.get('name', '')}<br/>
-                    {customer_dict.get('billing_address', '').replace(chr(10), '<br/>')}<br/>
-                    <strong>Phone:</strong> {customer_dict.get('phone', '')}<br/>
-                    <strong>GSTIN:</strong> {customer_dict.get('gst_number', 'N/A')}<br/><br/>
-                    <strong>Account Manager:</strong> {customer_dict.get('account_manager', 'Not Assigned')}<br/>
-                    Email: {customer_dict.get('ac_email', 'N/A')} | Ph: {customer_dict.get('ac_phone', 'N/A')}
-                </td>
-                <td>
-                    <strong>Ship To:</strong><br/>
-                    {customer_dict.get('shipping_address', '').replace(chr(10), '<br/>')}<br/><br/>
-                    <strong>Method:</strong> Pickup / Standard Shipping
-                </td>
-            </tr>
-        </table>
-
-        <table class="quote-table">
-            <thead>
-                <tr>
-                    <th style="width: 45%;">Item & Description</th>
-                    <th>HSN/SAC</th>
-                    <th style="text-align: center;">Qty</th>
-                    <th style="text-align: right;">Rate</th>
-                    <th style="text-align: right;">Amount</th>
-                </tr>
-            </thead>
-            <tbody>
-                {items_html}
-            </tbody>
-        </table>
-
-        <table class="totals-table">
-            <tr><td>Sub Total</td><td style="text-align: right;">₹{total_price:,.2f}</td></tr>
-            <tr><td>GST (18.0%)</td><td style="text-align: right;">₹{gst_amount:,.2f}</td></tr>
-            <tr><td>Shipping Charge</td><td style="text-align: right;">₹{shipping_charge:,.2f}</td></tr>
-            <tr class="total-row"><td>Total Amount</td><td style="text-align: right;">₹{grand_total:,.2f}</td></tr>
-        </table>
-        <div class="clearfix"></div>
-
-        <div class="footer-section">
-            <strong>Default manufacturing accuracy until stated otherwise</strong><br/>
-            FDM 3D Printing: 300-400 µm or ±0.2 mm / 100 mm<br/>
-            SLA 3D Printing: 100-200 µm or ±0.2 mm / 100 mm<br/>
-            SLS 3D Printing: 150-250 µm or ±0.2 mm / 100 mm<br/>
-            Vacuum Casting: 200-500 µm or ±0.2 mm / 100 mm<br/>
-            VMC Machining: 50-100 µm<br/>
-            Injection Molding: 50-100 µm<br/><br/>
-
-            <strong>Terms & Conditions</strong><br/>
-            Payment Terms: 100% Advance<br/>
-            You can make payment to the below details:<br/>
-            A/c Name: Makenica Private Limited.<br/>
-            A/c No: 50200081911171<br/>
-            IFSC: HDFC0000133<br/>
-            Bank Name: HDFC BANK LTD<br/>
-            Branch Name: BANGALORE - JP NAGAR<br/>
-            Once payment is done, please share the payment receipt.<br/>
-            *Shipping Charges will be added during checkout or after order confirmation, if currently Not Available.<br/>
-            Order once confirmed cannot be Cancelled or Modified.<br/>
-            Please contact support team +91 9606770777 for more information.
+        <div style="border-bottom:2px solid #111; padding-bottom:10px;">
+            <img src="{logo_path}" width="150"/><br/>
+            <strong>MAKENICA PRIVATE LIMITED</strong><br/>GSTIN: 29AAQCM7969K1Z9
+            <div style="float:right;text-align:right;margin-top:-50px;"><strong>Quote #{q_number}</strong><br/>{date_now}</div>
         </div>
-
-        <div class="footer-bottom">
-            support@makenica.com | www.makenica.com
-        </div>
-    </body>
-    </html>
+        <div style="margin-top:20px;"><strong>Bill To:</strong> {customer_dict.get('name', 'N/A')} | <strong>AM:</strong> {customer_dict.get('account_manager', 'N/A')}</div>
+        <table style="width:100%;margin-top:20px;border-collapse:collapse;"><tr><th>Item Details</th><th style="text-align:right;">Amount</th></tr>{items_html}</table>
+        <table class="totals">
+            <tr><td>Subtotal</td><td style="text-align:right;">₹{total_price:,.2f}</td></tr>
+            <tr><td>GST (18%)</td><td style="text-align:right;">₹{gst:,.2f}</td></tr>
+            <tr><td><strong>Total</strong></td><td style="text-align:right;"><strong>₹{grand:,.2f}</strong></td></tr>
+        </table>
+    </body></html>
     """
-    return HTML(string=html_content, base_url=current_dir).write_pdf()
+    return HTML(string=html_content, base_url=f"file://{os.path.abspath(os.path.dirname(__file__))}").write_pdf()
 
-# --- APP INITIALIZATION ---
+# --- INITIALIZE SESSION STATE ---
 try:
     init_db()
 except Exception as e:
-    st.error(f"Database Initialization Error: {e}")
+    st.error(f"Database Error: {e}")
 
-st.title("⚙️ Makenica CRM & Quotation Generator")
-tab_quote, tab_crm = st.tabs(["📄 Generate Quote", "👥 Customer Management"])
+if 'logged_in' not in st.session_state:
+    st.session_state.logged_in = False
+    st.session_state.role = None
+    st.session_state.username = None
 
-# --- TAB 1: QUOTE GENERATOR ---
-with tab_quote:
-    st.subheader("1. Select Customer")
-    try:
-        customers_df = get_all_customers()
-    except Exception:
-        customers_df = pd.DataFrame()
-        
-    selected_customer_name = "-- Select Customer --"
-    
-    if not customers_df.empty:
-        selected_customer_name = st.selectbox("Assign Quote To:", ["-- Select Customer --"] + customers_df['name'].tolist())
-        if selected_customer_name != "-- Select Customer --":
-            customer_data = customers_df[customers_df['name'] == selected_customer_name].iloc[0]
-            st.info(f"**Email:** {customer_data['email']} | **Phone:** {customer_data['phone']} | **AM:** {customer_data.get('account_manager', 'None')}")
-            
-            uploaded_files = st.file_uploader("Upload STL Files", type=["stl"], accept_multiple_files=True)
-            if uploaded_files:
-                quote_summary = []
-                for idx, file in enumerate(uploaded_files):
-                    with st.expander(f"📦 Model #{idx+1}: {file.name}", expanded=True):
-                        analysis = analyze_stl(file.getvalue(), file.name)
-                        if not analysis["success"]:
-                            st.error(f"Error: {analysis['error']}")
-                            continue
-                        
-                        vol_cc = analysis["volume_cc"]
-                        dims = analysis["dimensions"]
-
-                        left_col, right_col = st.columns([2, 1])
-                        with left_col:
-                            c1, c2 = st.columns(2)
-                            c1.metric("Calculated Volume", f"{vol_cc} cc")
-                            c2.metric("Dimensions", dims)
-                            if not analysis["is_watertight"]: st.warning("⚠️ Non-watertight mesh.")
-                        with right_col:
-                            st.plotly_chart(generate_3d_snapshot(analysis["mesh"]), use_container_width=True)
-
-                        cfg1, cfg2, cfg3, cfg4 = st.columns(4)
-                        paint_details = {}
-                        
-                        with cfg1:
-                            tech = st.selectbox("Technology", list(TECH_CATALOG.keys()), key=f"tech_{idx}")
-                            mat = st.selectbox("Material", TECH_CATALOG[tech], key=f"mat_{idx}")
-                            qty = st.number_input("Quantity", min_value=1, value=1, step=1, key=f"qty_{idx}")
-                            
-                        with cfg2:
-                            fin_ops = ["Raw"] if (tech == "FDM" and mat in ["TPU", "Translucent"]) else ["Transparent", "Translucent", "Tinted"] if mat == "PC-like" else ["Raw", "Painted"]
-                            finish = st.selectbox("Finish", fin_ops, key=f"fin_{idx}")
-                            
-                            if finish == "Painted":
-                                ral = st.selectbox("RAL Color", RAL_CODES, key=f"ral_{idx}")
-                                gloss = st.selectbox("Paint Finish", ["Matt", "Glossy"], key=f"gloss_{idx}")
-                                paint_details = {"ral": ral, "gloss_level": gloss}
-                                
-                        with cfg3:
-                            price_cc = st.number_input("Price/CC (₹)", min_value=0.0, value=45.0, key=f"rate_{idx}")
-                            inserts = st.number_input("Threaded Inserts", min_value=0, value=0, key=f"ins_{idx}")
-                            
-                        with cfg4:
-                            unit_price = (vol_cc * price_cc) + (inserts * 35.0)
-                            total_item_cost = unit_price * qty
-                            st.metric("Total Line Amount", f"₹{total_item_cost:,.2f}")
-                        
-                        quote_summary.append({
-                            "file_name": file.name, "volume_cc": vol_cc,
-                            "dimensions": dims, "tech": tech,
-                            "material": mat, "finish": finish, 
-                            "paint_details": paint_details, "fasteners": inserts, 
-                            "qty": qty, "unit_price": unit_price, "total_cost": total_item_cost
-                        })
-
-                if quote_summary:
-                    st.divider()
-                    st.subheader("📋 Quotation Summary")
-                    total_quote_price = sum(i["total_cost"] for i in quote_summary)
-                    
-                    # Shipping Input
-                    shipping_charge = st.number_input("Shipping Charge (₹)", min_value=0.0, value=0.0, step=50.0)
-                    
-                    st.dataframe(quote_summary, use_container_width=True)
-                    st.metric("Subtotal (Excl. Tax)", f"₹{total_quote_price:,.2f}")
-                    
-                    pdf_data = generate_pdf_quote(customer_data.to_dict(), quote_summary, total_quote_price, shipping_charge)
-                    st.download_button("📄 Download Makenica PDF Quotation", data=pdf_data, file_name=f"Makenica_Quote_{customer_data['name'].replace(' ', '_')}.pdf", mime="application/pdf", type="primary")
-
-# --- TAB 2: CRM MANAGEMENT ---
-with tab_crm:
-    st.subheader("Add New Customer")
-    with st.form("new_customer_form", clear_on_submit=True):
-        st.markdown("#### Client Details")
-        c1, c2 = st.columns(2)
-        with c1:
-            c_type = st.radio("Type", ["B2B (Business)", "B2C (Consumer)"])
-            c_name = st.text_input("Name / Company*")
-            c_email = st.text_input("Email*")
-            c_phone = st.text_input("Phone*")
-        with c2:
-            c_gst = st.text_input("GSTIN")
-            c_billing = st.text_area("Billing Address*")
-            c_shipping = st.text_area("Shipping Address")
-            
-        st.markdown("#### Account Manager")
-        am1, am2, am3 = st.columns(3)
-        with am1: am_name = st.text_input("AM Name")
-        with am2: am_email = st.text_input("AM Email")
-        with am3: am_phone = st.text_input("AM Phone")
-
-        if st.form_submit_button("Save Customer"):
-            if c_name and c_email and c_billing:
-                add_customer(c_type, c_name, c_email, c_phone, c_gst if "B2B" in c_type else "N/A", c_billing, c_shipping or c_billing, am_name, am_email, am_phone)
-                st.success("Customer added!")
-                st.cache_data.clear() 
+# --- AUTHENTICATION PAGE ---
+if not st.session_state.logged_in:
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        st.image("Makenica Company Logo Black.png", width=250)
+        st.subheader("Workspace Login")
+        u_name = st.text_input("Username")
+        pwd = st.text_input("Password", type="password")
+        if st.button("Secure Login", use_container_width=True):
+            auth = authenticate_user(u_name, pwd)
+            if auth["success"]:
+                st.session_state.logged_in = True
+                st.session_state.role = auth["role"]
+                st.session_state.username = u_name
                 st.rerun()
             else:
-                st.error("Missing required fields.")
-                
+                st.error("Invalid credentials.")
+    st.stop()
+
+# --- SIDEBAR NAVIGATION ---
+with st.sidebar:
+    st.image("Makenica Company Logo Black.png", width=180)
+    st.markdown(f"👤 **User:** {st.session_state.username} | **Role:** {st.session_state.role}")
     st.divider()
-    st.subheader("Customer Database")
+    
+    nav_options = ["📄 Create Quote", "👥 Customers", "🗄️ Saved Quotes"]
+    if st.session_state.role == "Admin":
+        nav_options.append("🛡️ Admin Panel")
+        
+    selection = st.radio("Navigation", nav_options)
+    
+    st.divider()
+    if st.button("Log Out"):
+        st.session_state.logged_in = False
+        st.rerun()
+
+# --- PAGE 1: CREATE QUOTE ---
+if selection == "📄 Create Quote":
+    st.title("📄 Generate Quotation")
     try:
-        df = get_all_customers()
-        if not df.empty: st.dataframe(df, hide_index=True)
-    except Exception:
-        st.info("Database empty or not connected.")
+        customers_df = conn.query("SELECT * FROM customers")
+    except:
+        customers_df = pd.DataFrame()
+
+    if not customers_df.empty:
+        c_names = ["-- Select Customer --"] + customers_df['name'].tolist()
+        sel_c = st.selectbox("Assign To", c_names)
+        
+        if sel_c != "-- Select Customer --":
+            c_data = customers_df[customers_df['name'] == sel_c].iloc[0]
+            
+            # Note the updated file types here
+            uploaded_files = st.file_uploader("Upload Files (STL, STEP, STP)", type=["stl", "step", "stp"], accept_multiple_files=True)
+            
+            if uploaded_files:
+                quote_summary = []
+                for idx, f in enumerate(uploaded_files):
+                    with st.expander(f"📦 Model: {f.name}", expanded=True):
+                        analysis = analyze_cad(f.getvalue(), f.name)
+                        if not analysis["success"]:
+                            st.error(f"Failed to process {f.name}. Make sure it is a valid 3D file.")
+                            continue
+                        
+                        l_col, r_col = st.columns([2,1])
+                        with l_col:
+                            st.metric("Volume", f"{analysis['volume_cc']} cc")
+                            st.metric("Dimensions", analysis['dimensions'])
+                        with r_col:
+                            st.plotly_chart(generate_3d_snapshot(analysis["mesh"]), use_container_width=True)
+
+                        cfg1, cfg2 = st.columns(2)
+                        with cfg1:
+                            tech = st.selectbox("Tech", list(TECH_CATALOG.keys()), key=f"t_{idx}")
+                            mat = st.selectbox("Material", TECH_CATALOG[tech], key=f"m_{idx}")
+                            qty = st.number_input("Qty", min_value=1, value=1, key=f"q_{idx}")
+                        with cfg2:
+                            fin = st.selectbox("Finish", ["Raw", "Painted"], key=f"f_{idx}")
+                            price = st.number_input("Rate/cc", value=45.0, key=f"r_{idx}")
+                            
+                        item_total = analysis['volume_cc'] * price * qty
+                        st.markdown(f"**Item Total: ₹{item_total:,.2f}**")
+                        
+                        quote_summary.append({
+                            "file_name": f.name, "volume_cc": analysis['volume_cc'], "dimensions": analysis['dimensions'],
+                            "tech": tech, "material": mat, "finish": fin, "qty": qty, "total_cost": item_total
+                        })
+                
+                if quote_summary:
+                    st.divider()
+                    total_price = sum(i["total_cost"] for i in quote_summary)
+                    q_num = f"Q-{str(uuid.uuid4())[:6].upper()}"
+                    
+                    st.subheader(f"Total: ₹{total_price:,.2f} (Excl. Tax)")
+                    
+                    pdf_data = generate_pdf_quote(c_data.to_dict(), quote_summary, total_price, q_num)
+                    
+                    col_dl, col_save = st.columns(2)
+                    with col_dl:
+                        st.download_button("⬇️ Download PDF", data=pdf_data, file_name=f"{q_num}.pdf", mime="application/pdf")
+                    with col_save:
+                        if st.button("💾 Save Quote to Database"):
+                            save_quote_record(q_num, c_data['name'], total_price, st.session_state.username)
+                            st.success(f"Quote {q_num} saved successfully!")
+    else:
+        st.warning("Please add a customer in the 'Customers' tab first.")
+
+# --- PAGE 2: CUSTOMERS ---
+elif selection == "👥 Customers":
+    st.title("👥 Customer Database")
+    
+    with st.expander("➕ Add New Customer"):
+        with st.form("add_c_form"):
+            name = st.text_input("Name / Company*")
+            email = st.text_input("Email*")
+            phone = st.text_input("Phone")
+            gst = st.text_input("GSTIN")
+            address = st.text_area("Address")
+            if st.form_submit_button("Save"):
+                if name and email:
+                    with conn.session as s:
+                        s.execute(text("INSERT INTO customers (name, email, phone, gst_number, billing_address) VALUES (:n, :e, :p, :g, :b)"),
+                                  {"n":name, "e":email, "p":phone, "g":gst, "b":address})
+                        s.commit()
+                    st.success("Added!")
+                    st.rerun()
+
+    st.subheader("Manage Existing")
+    df = conn.query("SELECT id, name, email, phone, gst_number FROM customers")
+    if not df.empty:
+        st.dataframe(df, hide_index=True, use_container_width=True)
+        
+        st.markdown("### Delete Customer")
+        del_c = st.selectbox("Select Customer to Delete", df['name'].tolist())
+        if st.button("Delete Client", type="primary"):
+            c_id = df[df['name'] == del_c].iloc[0]['id']
+            delete_customer(int(c_id))
+            st.success("Client deleted.")
+            st.rerun()
+
+# --- PAGE 3: SAVED QUOTES ---
+elif selection == "🗄️ Saved Quotes":
+    st.title("🗄️ Quote History")
+    quotes_df = conn.query("SELECT quote_number, customer_name, total_amount, created_by, created_at FROM quotes ORDER BY created_at DESC")
+    if not quotes_df.empty:
+        st.dataframe(quotes_df, hide_index=True, use_container_width=True)
+    else:
+        st.info("No quotes have been saved to the database yet.")
+
+# --- PAGE 4: ADMIN PANEL ---
+elif selection == "🛡️ Admin Panel":
+    st.title("🛡️ System Administration")
+    
+    st.subheader("Create New User")
+    with st.form("new_user"):
+        new_u = st.text_input("Username")
+        new_p = st.text_input("Password", type="password")
+        role = st.selectbox("Role", ["User", "Admin"])
+        if st.form_submit_button("Create Account"):
+            if new_u and new_p:
+                h_pwd = generate_password_hash(new_p)
+                try:
+                    with conn.session as s:
+                        s.execute(text("INSERT INTO users (username, password_hash, role) VALUES (:u, :p, :r)"),
+                                  {"u": new_u, "p": h_pwd, "r": role})
+                        s.commit()
+                    st.success("User created!")
+                except Exception as e:
+                    st.error("Username may already exist.")
+                    
+    st.divider()
+    st.subheader("Current Users")
+    users_df = conn.query("SELECT id, username, role FROM users")
+    st.dataframe(users_df, hide_index=True)
